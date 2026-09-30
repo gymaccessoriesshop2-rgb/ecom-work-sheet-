@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import type { Employee } from '../types/database.types';
+import { OFFICIAL_TEAM, filterAnonymousBosses } from '../constants/team';
 import {
   UploadCloud, FileText, Image, Video, Archive, Download, Trash2,
   CheckCircle, Users, Send, X, AlertCircle, RefreshCw,
@@ -41,10 +42,11 @@ const CHUNK_SIZE = 64 * 1024; // 64 KB chunks for optimal LAN streaming
 export const TeamDrop: React.FC = () => {
   const { profile } = useAuth();
   const [employees, setEmployees] = useState<Employee[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
 
-  // Online peer IDs discovered via zero-cost Supabase Realtime presence
+  // Online peer discovery (tracked by both UUID and lowercase email for 100% reliability)
   const [onlineUserIds, setOnlineUserIds] = useState<Set<string>>(new Set());
+  const [onlineEmails, setOnlineEmails] = useState<Set<string>>(new Set());
 
   // Active view tab: 'inbox' | 'outbox'
   const [activeTab, setActiveTab] = useState<'inbox' | 'outbox'>('inbox');
@@ -89,22 +91,57 @@ export const TeamDrop: React.FC = () => {
   // References
   const fileInputRef = useRef<HTMLInputElement>(null);
   const channelRef = useRef<any>(null);
-  const peerConnectionsRef = useRef<{ [peerId: string]: RTCPeerConnection }>({});
-  const dataChannelsRef = useRef<{ [peerId: string]: RTCDataChannel }>({});
+  const peerConnectionsRef = useRef<{ [peerKey: string]: RTCPeerConnection }>({});
+  const dataChannelsRef = useRef<{ [peerKey: string]: RTCDataChannel }>({});
   const incomingChunksRef = useRef<{ [transferKey: string]: { chunks: ArrayBuffer[]; total: number; meta: any } }>({});
 
-  // Fetch employees list
+  // Fetch employees list (Guarantees all 7 operational team members are visible and filters out anonymous bosses)
   const fetchEmployees = async () => {
     setLoading(true);
     try {
-      const { data, error } = await supabase
+      const { data } = await supabase
         .from('employees')
-        .select('id, full_name, position, role, email')
+        .select('*')
         .eq('status', 'Active');
-      if (error) throw error;
-      setEmployees((data || []) as Employee[]);
+
+      const rawList = (data || []) as Employee[];
+      // 1. Completely filter out Ali Hassan and Rana Hasnain (Bosses remain anonymous)
+      const visibleList = filterAnonymousBosses(rawList);
+
+      // 2. Map existing by email
+      const byEmail = new Map<string, Employee>();
+      visibleList.forEach(e => {
+        if (e.email) byEmail.set(e.email.toLowerCase(), e);
+      });
+
+      // 3. Merge with OFFICIAL_TEAM so that even if Supabase RLS restricted selection,
+      // all 7 members (Manager + 6 Employees) are visible to everyone
+      const mergedRoster: Employee[] = OFFICIAL_TEAM.map(preset => {
+        const existing = byEmail.get(preset.email.toLowerCase());
+        if (existing) {
+          return {
+            ...existing,
+            full_name: existing.full_name || preset.full_name,
+            position: existing.position || preset.position,
+            role: existing.role || preset.role
+          };
+        }
+        return {
+          ...preset,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        } as Employee;
+      });
+
+      setEmployees(mergedRoster);
     } catch (e: any) {
       console.error('Failed to load team members:', e);
+      // Fallback to static roster
+      setEmployees(OFFICIAL_TEAM.map(p => ({
+        ...p,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })) as Employee[]);
     } finally {
       setLoading(false);
     }
@@ -136,20 +173,27 @@ export const TeamDrop: React.FC = () => {
   }, [sentHistory, profile?.id]);
 
   // Clean WebRTC peer connection
-  const closePeer = useCallback((peerId: string) => {
-    if (dataChannelsRef.current[peerId]) {
-      try { dataChannelsRef.current[peerId].close(); } catch {}
-      delete dataChannelsRef.current[peerId];
+  const closePeer = useCallback((peerKey: string) => {
+    if (dataChannelsRef.current[peerKey]) {
+      try { dataChannelsRef.current[peerKey].close(); } catch {}
+      delete dataChannelsRef.current[peerKey];
     }
-    if (peerConnectionsRef.current[peerId]) {
-      try { peerConnectionsRef.current[peerId].close(); } catch {}
-      delete peerConnectionsRef.current[peerId];
+    if (peerConnectionsRef.current[peerKey]) {
+      try { peerConnectionsRef.current[peerKey].close(); } catch {}
+      delete peerConnectionsRef.current[peerKey];
     }
   }, []);
 
+  // Helper: check if a member is online on Wi-Fi
+  const isMemberOnline = useCallback((emp: Employee) => {
+    if (onlineUserIds.has(emp.id)) return true;
+    if (emp.email && onlineEmails.has(emp.email.toLowerCase())) return true;
+    return false;
+  }, [onlineUserIds, onlineEmails]);
+
   // Create an RTCPeerConnection configured for local LAN ICE exchange
-  const createPeerConnection = useCallback((peerId: string) => {
-    closePeer(peerId);
+  const createPeerConnection = useCallback((peerKey: string, targetUserId: string, targetEmail: string) => {
+    closePeer(peerKey);
 
     const pc = new RTCPeerConnection({
       iceServers: [
@@ -164,8 +208,10 @@ export const TeamDrop: React.FC = () => {
           type: 'broadcast',
           event: 'p2p-signal',
           payload: {
-            targetUserId: peerId,
+            targetUserId: targetUserId,
+            targetEmail: targetEmail.toLowerCase(),
             senderUserId: profile.id,
+            senderEmail: (profile.email || '').toLowerCase(),
             signalType: 'candidate',
             candidate: event.candidate
           }
@@ -173,12 +219,12 @@ export const TeamDrop: React.FC = () => {
       }
     };
 
-    peerConnectionsRef.current[peerId] = pc;
+    peerConnectionsRef.current[peerKey] = pc;
     return pc;
   }, [closePeer, profile]);
 
   // Handle incoming data channel setup on Receiver side
-  const setupReceiverChannel = useCallback((channel: RTCDataChannel, senderId: string) => {
+  const setupReceiverChannel = useCallback((channel: RTCDataChannel, senderKey: string) => {
     channel.binaryType = 'arraybuffer';
     let currentTransferKey = '';
     let currentMeta: any = null;
@@ -193,7 +239,7 @@ export const TeamDrop: React.FC = () => {
           const msg = JSON.parse(event.data);
           if (msg.type === 'START_FILE') {
             currentMeta = msg.fileMeta;
-            currentTransferKey = `${senderId}_${currentMeta.name}_${Date.now()}`;
+            currentTransferKey = `${senderKey}_${currentMeta.name}_${Date.now()}`;
             incomingChunksRef.current[currentTransferKey] = {
               chunks: [],
               total: currentMeta.size,
@@ -237,7 +283,7 @@ export const TeamDrop: React.FC = () => {
                 name: transfer.meta.name,
                 size: transfer.meta.size,
                 type: transfer.meta.type,
-                senderId: senderId,
+                senderId: senderKey,
                 senderName: transfer.meta.senderName,
                 recipientIds: [profile?.id || ''],
                 recipientNames: [profile?.full_name || 'You'],
@@ -315,17 +361,25 @@ export const TeamDrop: React.FC = () => {
 
   // Handle incoming signaling messages
   const handleSignal = useCallback(async (payload: any) => {
-    if (!profile || payload.targetUserId !== profile.id) return;
+    if (!profile) return;
 
-    const { senderUserId, signalType, sdp, candidate } = payload;
+    // Check if the signal is intended for me (matching by UUID or lowercase Email)
+    const isTargetMe =
+      payload.targetUserId === profile.id ||
+      (payload.targetEmail && payload.targetEmail.toLowerCase() === (profile.email || '').toLowerCase());
+
+    if (!isTargetMe) return;
+
+    const { senderUserId, senderEmail, signalType, sdp, candidate } = payload;
+    const peerKey = senderEmail || senderUserId;
 
     try {
       if (signalType === 'offer') {
-        const pc = createPeerConnection(senderUserId);
+        const pc = createPeerConnection(peerKey, senderUserId, senderEmail);
 
         pc.ondatachannel = (e) => {
-          dataChannelsRef.current[senderUserId] = e.channel;
-          setupReceiverChannel(e.channel, senderUserId);
+          dataChannelsRef.current[peerKey] = e.channel;
+          setupReceiverChannel(e.channel, peerKey);
         };
 
         await pc.setRemoteDescription(new RTCSessionDescription(sdp));
@@ -337,18 +391,20 @@ export const TeamDrop: React.FC = () => {
           event: 'p2p-signal',
           payload: {
             targetUserId: senderUserId,
+            targetEmail: (senderEmail || '').toLowerCase(),
             senderUserId: profile.id,
+            senderEmail: (profile.email || '').toLowerCase(),
             signalType: 'answer',
             sdp: answer
           }
         });
       } else if (signalType === 'answer') {
-        const pc = peerConnectionsRef.current[senderUserId];
+        const pc = peerConnectionsRef.current[peerKey];
         if (pc) {
           await pc.setRemoteDescription(new RTCSessionDescription(sdp));
         }
       } else if (signalType === 'candidate') {
-        const pc = peerConnectionsRef.current[senderUserId];
+        const pc = peerConnectionsRef.current[peerKey];
         if (pc && candidate) {
           await pc.addIceCandidate(new RTCIceCandidate(candidate));
         }
@@ -375,19 +431,48 @@ export const TeamDrop: React.FC = () => {
       .on('presence', { event: 'sync' }, () => {
         const state = channel.presenceState();
         const activeIds = new Set<string>();
-        Object.keys(state).forEach(key => activeIds.add(key));
-        setOnlineUserIds(activeIds);
-      })
-      .on('presence', { event: 'join' }, ({ key }) => {
-        setOnlineUserIds(prev => new Set(prev).add(key));
-      })
-      .on('presence', { event: 'leave' }, ({ key }) => {
-        setOnlineUserIds(prev => {
-          const next = new Set(prev);
-          next.delete(key);
-          return next;
+        const activeEmails = new Set<string>();
+
+        Object.values(state).forEach((presences: any) => {
+          if (Array.isArray(presences)) {
+            presences.forEach((p: any) => {
+              if (p.user_id) activeIds.add(p.user_id);
+              if (p.email) activeEmails.add(p.email.toLowerCase());
+            });
+          }
         });
-        closePeer(key);
+
+        setOnlineUserIds(activeIds);
+        setOnlineEmails(activeEmails);
+      })
+      .on('presence', { event: 'join' }, ({ newPresences }) => {
+        if (Array.isArray(newPresences)) {
+          newPresences.forEach((p: any) => {
+            if (p.user_id) setOnlineUserIds(prev => new Set(prev).add(p.user_id));
+            if (p.email) setOnlineEmails(prev => new Set(prev).add(p.email.toLowerCase()));
+          });
+        }
+      })
+      .on('presence', { event: 'leave' }, ({ leftPresences }) => {
+        if (Array.isArray(leftPresences)) {
+          leftPresences.forEach((p: any) => {
+            if (p.user_id) {
+              setOnlineUserIds(prev => {
+                const next = new Set(prev);
+                next.delete(p.user_id);
+                return next;
+              });
+            }
+            if (p.email) {
+              setOnlineEmails(prev => {
+                const next = new Set(prev);
+                next.delete(p.email.toLowerCase());
+                return next;
+              });
+              closePeer(p.email.toLowerCase());
+            }
+          });
+        }
       })
       .on('broadcast', { event: 'p2p-signal' }, ({ payload }) => {
         handleSignal(payload);
@@ -396,6 +481,7 @@ export const TeamDrop: React.FC = () => {
         if (status === 'SUBSCRIBED') {
           await channel.track({
             user_id: profile.id,
+            email: (profile.email || '').toLowerCase(),
             name: profile.full_name,
             role: profile.role,
             online_at: new Date().toISOString()
@@ -460,7 +546,8 @@ export const TeamDrop: React.FC = () => {
   const sendFileToPeer = async (peer: Employee, file: File, noteText: string): Promise<boolean> => {
     if (!profile) return false;
 
-    const transferId = `send_${peer.id}_${Date.now()}`;
+    const peerKey = peer.email?.toLowerCase() || peer.id;
+    const transferId = `send_${peerKey}_${Date.now()}`;
 
     // Add active transfer state
     setActiveTransfers(prev => ({
@@ -480,10 +567,10 @@ export const TeamDrop: React.FC = () => {
 
     return new Promise(async (resolve) => {
       try {
-        const pc = createPeerConnection(peer.id);
+        const pc = createPeerConnection(peerKey, peer.id, peer.email || '');
         const dataChannel = pc.createDataChannel('fileTransfer', { ordered: true });
         dataChannel.binaryType = 'arraybuffer';
-        dataChannelsRef.current[peer.id] = dataChannel;
+        dataChannelsRef.current[peerKey] = dataChannel;
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
@@ -494,7 +581,10 @@ export const TeamDrop: React.FC = () => {
           event: 'p2p-signal',
           payload: {
             targetUserId: peer.id,
+            targetEmail: (peer.email || '').toLowerCase(),
             senderUserId: profile.id,
+            senderEmail: (profile.email || '').toLowerCase(),
+            senderName: profile.full_name,
             signalType: 'offer',
             sdp: offer,
             fileMeta: {
@@ -518,7 +608,7 @@ export const TeamDrop: React.FC = () => {
             }
           }));
           toast.error(`Connection to ${peer.full_name} timed out. Ensure their browser is on the Team Drop page.`);
-          closePeer(peer.id);
+          closePeer(peerKey);
           resolve(false);
         }, 15000);
 
@@ -604,7 +694,7 @@ export const TeamDrop: React.FC = () => {
                 delete copy[transferId];
                 return copy;
               });
-              closePeer(peer.id);
+              closePeer(peerKey);
             }, 3000);
 
             resolve(true);
@@ -624,7 +714,7 @@ export const TeamDrop: React.FC = () => {
               speed: 'Error'
             }
           }));
-          closePeer(peer.id);
+          closePeer(peerKey);
           resolve(false);
         };
       } catch (e: any) {
@@ -634,21 +724,25 @@ export const TeamDrop: React.FC = () => {
     });
   };
 
-  // Handle master send action
+  // Handle master send action (Available to Manager AND all Employees alike!)
   const handleInitiateTransfer = async () => {
     if (!fileToSend || !profile) return;
+
+    // Helper to check if a peer is current user
+    const isPeerMe = (p: Employee) =>
+      p.id === profile.id || (p.email && p.email.toLowerCase() === (profile.email || '').toLowerCase());
 
     // Determine target peers
     let targetEmployees: Employee[] = [];
     if (sendToAll) {
-      targetEmployees = employees.filter(e => e.id !== profile.id && onlineUserIds.has(e.id));
+      targetEmployees = employees.filter(e => !isPeerMe(e) && isMemberOnline(e));
       if (targetEmployees.length === 0) {
         toast.error('No other team members are currently online on Wi-Fi. Ask them to open this page!');
         return;
       }
     } else {
       targetEmployees = employees.filter(e => selectedRecipients.includes(e.id));
-      const offlineTargets = targetEmployees.filter(e => !onlineUserIds.has(e.id));
+      const offlineTargets = targetEmployees.filter(e => !isMemberOnline(e));
       if (offlineTargets.length > 0) {
         toast(() => (
           <span style={{ fontSize: '0.8rem' }}>
@@ -667,7 +761,7 @@ export const TeamDrop: React.FC = () => {
 
     let successCount = 0;
     for (const peer of targetEmployees) {
-      if (onlineUserIds.has(peer.id)) {
+      if (isMemberOnline(peer)) {
         const ok = await sendFileToPeer(peer, fileToSend, fileNotes.trim());
         if (ok) successCount++;
       }
@@ -728,6 +822,12 @@ export const TeamDrop: React.FC = () => {
 
   const activeTransferList = Object.values(activeTransfers);
 
+  // Count total distinct peers online on Wi-Fi (excluding oneself)
+  const totalOnlinePeers = employees.filter(e => {
+    const isMe = e.id === profile?.id || (e.email && e.email.toLowerCase() === (profile?.email || '').toLowerCase());
+    return !isMe && isMemberOnline(e);
+  }).length;
+
   return (
     <div>
       {/* ── Top Header Banner with Wi-Fi & 100% Free Badge ── */}
@@ -758,7 +858,7 @@ export const TeamDrop: React.FC = () => {
             }}
           >
             <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#10b981', display: 'inline-block', boxShadow: '0 0 8px #10b981' }} />
-            <span><b>{onlineUserIds.size}</b> on Wi-Fi Drop</span>
+            <span><b>{totalOnlinePeers + 1}</b> on Wi-Fi Drop</span>
           </div>
 
           <button className="btn btn-secondary btn-sm" onClick={fetchEmployees} disabled={loading} title="Refresh team">
@@ -821,19 +921,19 @@ export const TeamDrop: React.FC = () => {
         </div>
       )}
 
-      {/* ── Interactive Drop Target Grid: All Team Members with Real-Time Wi-Fi Indicator ── */}
+      {/* ── Interactive Drop Target Grid: All 7 Team Members (Manager + 6 Employees) ── */}
       <div className="card mb-4" style={{ padding: '1rem' }}>
         <div className="flex items-center justify-between mb-2.5">
           <div className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
             <Users size={14} className="text-primary" />
-            1. Select Recipient(s) or Drag a File Directly Onto a Card:
+            1. Select Recipient(s) or Drag a File Directly Onto Any Colleague:
           </div>
           <span className="text-xs text-muted">
             {sendToAll ? 'Target: All Online Members' : `Target: ${selectedRecipients.length} member(s)`}
           </span>
         </div>
 
-        <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
           {/* Entire Team Card */}
           <div
             onClick={selectEveryone}
@@ -874,10 +974,10 @@ export const TeamDrop: React.FC = () => {
             </div>
           </div>
 
-          {/* Individual Member Cards */}
+          {/* Individual Member Cards (Manager & Employees - All visible and accessible to Rayan & everyone) */}
           {employees.map(emp => {
-            const isMe = emp.id === profile?.id;
-            const isOnline = onlineUserIds.has(emp.id);
+            const isMe = emp.id === profile?.id || (emp.email && emp.email.toLowerCase() === (profile?.email || '').toLowerCase());
+            const isOnline = isMemberOnline(emp);
             const isSelected = !sendToAll && selectedRecipients.includes(emp.id);
             const isDragOver = dragOverMemberId === emp.id;
 
@@ -899,7 +999,7 @@ export const TeamDrop: React.FC = () => {
                 style={{
                   padding: '0.625rem 0.75rem',
                   cursor: isMe ? 'default' : 'pointer',
-                  opacity: isMe ? 0.6 : 1,
+                  opacity: isMe ? 0.7 : 1,
                   border: isDragOver
                     ? '2px dashed var(--primary)'
                     : isSelected
@@ -921,7 +1021,7 @@ export const TeamDrop: React.FC = () => {
                   <div style={{ position: 'relative', flexShrink: 0 }}>
                     <div style={{
                       width: 28, height: 28, borderRadius: '50%',
-                      background: emp.role === 'ADMIN' ? 'var(--primary)' : emp.role === 'BOSS' ? 'var(--info)' : '#10b981',
+                      background: emp.role === 'ADMIN' ? 'var(--primary)' : '#10b981',
                       display: 'flex', alignItems: 'center', justifyContent: 'center',
                       color: '#fff', fontSize: '0.72rem', fontWeight: 700
                     }}>
@@ -948,8 +1048,10 @@ export const TeamDrop: React.FC = () => {
                     <div className="font-semibold text-xs text-white truncate">
                       {emp.full_name} {isMe && '(You)'}
                     </div>
-                    <div className="text-xs truncate" style={{ color: isOnline ? '#34d399' : 'var(--text-muted)' }}>
-                      {isOnline ? '🟢 On Wi-Fi' : '⚪ Offline'}
+                    <div className="text-xs truncate flex items-center gap-1" style={{ color: isOnline ? '#34d399' : 'var(--text-muted)' }}>
+                      <span>{emp.position || 'Team Member'}</span>
+                      <span>•</span>
+                      <span>{isOnline ? 'On Wi-Fi' : 'Offline'}</span>
                     </div>
                   </div>
 
@@ -1031,7 +1133,7 @@ export const TeamDrop: React.FC = () => {
             >
               <Zap size={14} />
               {sendToAll
-                ? `Send to All Online on Wi-Fi (${onlineUserIds.size > 1 ? onlineUserIds.size - 1 : 0})`
+                ? `Send to All Online on Wi-Fi (${totalOnlinePeers})`
                 : `Send to ${selectedRecipients.length} Member(s)`}
             </button>
             <button

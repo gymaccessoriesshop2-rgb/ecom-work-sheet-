@@ -7,7 +7,8 @@ import {
   CheckCircle, AlertCircle, ArrowUpRight, ShoppingBag
 } from 'lucide-react';
 import { format } from 'date-fns';
-import type { ActivityLog } from '../types/database.types';
+import type { ActivityLog, Employee } from '../types/database.types';
+import { filterAnonymousBosses } from '../constants/team';
 
 interface MemberWorkload {
   id: string;
@@ -49,12 +50,12 @@ export const Dashboard: React.FC = () => {
       try {
         if (isViewer) {
           const [teamRes, tasksRes, activityRes] = await Promise.all([
-            supabase.from('employees').select('id, full_name, position, role').eq('status', 'Active'),
+            supabase.from('employees').select('*').eq('status', 'Active'),
             supabase.from('tasks').select('id, status, assigned_to'),
             supabase.from('activity_logs').select('*, user:employees(full_name)').order('created_at', { ascending: false }).limit(8),
           ]);
 
-          const allEmployees = teamRes.data || [];
+          const allEmployees = filterAnonymousBosses((teamRes.data || []) as Employee[]);
           const tasks = tasksRes.data || [];
 
           setStats({

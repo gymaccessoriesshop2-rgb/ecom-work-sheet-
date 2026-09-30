@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import type { Employee } from '../types/database.types';
 import { useAuth } from '../contexts/AuthContext';
+import { filterAnonymousBosses, OFFICIAL_TEAM } from '../constants/team';
 import { Users, Plus, Search, Edit, Trash2, Shield, Eye, X, AlertTriangle } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { format } from 'date-fns';
@@ -49,15 +50,45 @@ export const Employees: React.FC = () => {
   const fetchData = async () => {
     setLoading(true);
     try {
-      const { data, error } = await supabase
+      const { data } = await supabase
         .from('employees')
         .select('*')
         .order('created_at', { ascending: false });
 
-      if (error) throw error;
-      setEmployees((data || []) as Employee[]);
+      const rawList = (data || []) as Employee[];
+      // Filter out anonymous bosses completely
+      const visibleList = filterAnonymousBosses(rawList);
+
+      const byEmail = new Map<string, Employee>();
+      visibleList.forEach(e => {
+        if (e.email) byEmail.set(e.email.toLowerCase(), e);
+      });
+
+      const mergedRoster: Employee[] = OFFICIAL_TEAM.map(preset => {
+        const existing = byEmail.get(preset.email.toLowerCase());
+        if (existing) {
+          return {
+            ...existing,
+            full_name: existing.full_name || preset.full_name,
+            position: existing.position || preset.position,
+            role: existing.role || preset.role
+          };
+        }
+        return {
+          ...preset,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        } as Employee;
+      });
+
+      setEmployees(mergedRoster);
     } catch (e: any) {
-      toast.error(e.message);
+      console.error('Employees load error:', e);
+      setEmployees(OFFICIAL_TEAM.map(p => ({
+        ...p,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })) as Employee[]);
     } finally {
       setLoading(false);
     }
@@ -271,7 +302,6 @@ export const Employees: React.FC = () => {
             <option value="">All Roles</option>
             <option value="EMPLOYEE">Employees</option>
             <option value="ADMIN">Manager (Admin)</option>
-            <option value="BOSS">Boss (View Only)</option>
           </select>
         </div>
       </div>
@@ -439,12 +469,11 @@ export const Employees: React.FC = () => {
                     onChange={e => setForm({
                       ...form,
                       role: e.target.value,
-                      position: form.position || (e.target.value === 'BOSS' ? 'Boss' : e.target.value === 'ADMIN' ? 'Manager' : 'Team Member')
+                      position: form.position || (e.target.value === 'ADMIN' ? 'Manager' : 'Team Member')
                     })}
                   >
                     <option value="EMPLOYEE">Employee (Does tasks)</option>
                     <option value="ADMIN">Manager (Assigns & Approves)</option>
-                    <option value="BOSS">Boss (Views only)</option>
                   </select>
                 </div>
                 <div className="form-group">

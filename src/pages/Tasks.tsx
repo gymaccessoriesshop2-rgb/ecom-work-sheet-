@@ -11,6 +11,7 @@ import toast from 'react-hot-toast';
 import { format, isPast, parseISO } from 'date-fns';
 
 import { ECOM_CATEGORIES, ECOM_PLATFORMS } from '../constants/ecom';
+import { filterAnonymousBosses, OFFICIAL_TEAM } from '../constants/team';
 
 export const Tasks: React.FC = () => {
   const { profile } = useAuth();
@@ -97,12 +98,42 @@ export const Tasks: React.FC = () => {
       ]);
 
       if (tasksRes.error) throw tasksRes.error;
-      if (empRes.error) throw empRes.error;
 
       setTasks((tasksRes.data || []) as Task[]);
-      setEmployees((empRes.data || []) as Employee[]);
+
+      const rawEmps = (empRes.data || []) as Employee[];
+      const visibleEmps = filterAnonymousBosses(rawEmps);
+
+      const byEmail = new Map<string, Employee>();
+      visibleEmps.forEach(e => {
+        if (e.email) byEmail.set(e.email.toLowerCase(), e);
+      });
+
+      const mergedRoster: Employee[] = OFFICIAL_TEAM.map(preset => {
+        const existing = byEmail.get(preset.email.toLowerCase());
+        if (existing) {
+          return {
+            ...existing,
+            full_name: existing.full_name || preset.full_name,
+            position: existing.position || preset.position,
+            role: existing.role || preset.role
+          };
+        }
+        return {
+          ...preset,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        } as Employee;
+      });
+
+      setEmployees(mergedRoster);
     } catch (e: any) {
       toast.error(e.message || 'Error loading worksheet');
+      setEmployees(OFFICIAL_TEAM.map(p => ({
+        ...p,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })) as Employee[]);
     } finally {
       setLoading(false);
     }
