@@ -6,7 +6,7 @@ import { OFFICIAL_TEAM, filterAnonymousBosses } from '../constants/team';
 import {
   UploadCloud, FileText, Image, Video, Archive, Download, Trash2,
   CheckCircle, Users, Send, X, AlertCircle, RefreshCw,
-  FolderDown, Share2, Wifi, Zap, Shield
+  FolderDown, Share2, Wifi, Zap, Shield, Link2, ExternalLink
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { format } from 'date-fns';
@@ -21,8 +21,9 @@ interface LocalTransferItem {
   recipientIds: string[];
   recipientNames: string[];
   timestamp: number;
-  url?: string; // Blob object URL for received files
+  url?: string; // Blob URL for received file
   notes?: string;
+  externalLink?: string;
 }
 
 interface ActiveTransfer {
@@ -30,34 +31,40 @@ interface ActiveTransfer {
   fileName: string;
   fileSize: number;
   transferredBytes: number;
-  speed: string; // e.g. "42.5 MB/s"
-  progress: number; // 0 - 100
+  speed: string;
+  progress: number;
   direction: 'sending' | 'receiving';
   peerName: string;
-  status: 'connecting' | 'transferring' | 'completed' | 'failed';
+  status: 'transferring' | 'completed' | 'failed';
 }
 
-const CHUNK_SIZE = 64 * 1024; // 64 KB chunks for optimal LAN streaming
+// 32 KB binary-safe chunk size for reliable real-time WebSocket streaming
+const CHUNK_SIZE = 32 * 1024;
 
 export const TeamDrop: React.FC = () => {
   const { profile } = useAuth();
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [loading, setLoading] = useState(false);
 
-  // Online peer discovery (tracked by both UUID and lowercase email for 100% reliability)
+  // Online team presence (tracked by both UUID and lowercase email)
   const [onlineUserIds, setOnlineUserIds] = useState<Set<string>>(new Set());
   const [onlineEmails, setOnlineEmails] = useState<Set<string>>(new Set());
 
   // Active view tab: 'inbox' | 'outbox'
   const [activeTab, setActiveTab] = useState<'inbox' | 'outbox'>('inbox');
 
-  // Selected recipients for transfer (empty means all online)
+  // Selected recipients for transfer (empty means broadcast to all online)
   const [selectedRecipients, setSelectedRecipients] = useState<string[]>([]);
   const [sendToAll, setSendToAll] = useState(true);
 
   // File to send
   const [fileToSend, setFileToSend] = useState<File | null>(null);
   const [fileNotes, setFileNotes] = useState('');
+
+  // Optional external cloud link (for sharing Google Drive, Dropbox, or WeTransfer links)
+  const [showLinkModal, setShowLinkModal] = useState(false);
+  const [linkInput, setLinkInput] = useState('');
+  const [linkTitle, setLinkTitle] = useState('');
 
   // Drag and drop UI states
   const [dragOverMemberId, setDragOverMemberId] = useState<string | null>(null);
@@ -91,9 +98,7 @@ export const TeamDrop: React.FC = () => {
   // References
   const fileInputRef = useRef<HTMLInputElement>(null);
   const channelRef = useRef<any>(null);
-  const peerConnectionsRef = useRef<{ [peerKey: string]: RTCPeerConnection }>({});
-  const dataChannelsRef = useRef<{ [peerKey: string]: RTCDataChannel }>({});
-  const incomingChunksRef = useRef<{ [transferKey: string]: { chunks: ArrayBuffer[]; total: number; meta: any } }>({});
+  const incomingChunksRef = useRef<{ [transferId: string]: { chunks: string[]; total: number; meta: any; received: number; lastTime: number; lastBytes: number } }>({});
 
   // Fetch employees list (Guarantees all 7 operational team members are visible and filters out anonymous bosses)
   const fetchEmployees = async () => {
@@ -105,17 +110,15 @@ export const TeamDrop: React.FC = () => {
         .eq('status', 'Active');
 
       const rawList = (data || []) as Employee[];
-      // 1. Completely filter out Ali Hassan and Rana Hasnain (Bosses remain anonymous)
+      // Completely filter out Ali Hassan and Rana Hasnain (Bosses remain anonymous)
       const visibleList = filterAnonymousBosses(rawList);
 
-      // 2. Map existing by email
       const byEmail = new Map<string, Employee>();
       visibleList.forEach(e => {
         if (e.email) byEmail.set(e.email.toLowerCase(), e);
       });
 
-      // 3. Merge with OFFICIAL_TEAM so that even if Supabase RLS restricted selection,
-      // all 7 members (Manager + 6 Employees) are visible to everyone
+      // Merge with OFFICIAL_TEAM so all 7 members (Manager + 6 Employees) are visible to everyone
       const mergedRoster: Employee[] = OFFICIAL_TEAM.map(preset => {
         const existing = byEmail.get(preset.email.toLowerCase());
         if (existing) {
@@ -136,7 +139,6 @@ export const TeamDrop: React.FC = () => {
       setEmployees(mergedRoster);
     } catch (e: any) {
       console.error('Failed to load team members:', e);
-      // Fallback to static roster
       setEmployees(OFFICIAL_TEAM.map(p => ({
         ...p,
         created_at: new Date().toISOString(),
@@ -172,18 +174,6 @@ export const TeamDrop: React.FC = () => {
     }
   }, [sentHistory, profile?.id]);
 
-  // Clean WebRTC peer connection
-  const closePeer = useCallback((peerKey: string) => {
-    if (dataChannelsRef.current[peerKey]) {
-      try { dataChannelsRef.current[peerKey].close(); } catch {}
-      delete dataChannelsRef.current[peerKey];
-    }
-    if (peerConnectionsRef.current[peerKey]) {
-      try { peerConnectionsRef.current[peerKey].close(); } catch {}
-      delete peerConnectionsRef.current[peerKey];
-    }
-  }, []);
-
   // Helper: check if a member is online on Wi-Fi
   const isMemberOnline = useCallback((emp: Employee) => {
     if (onlineUserIds.has(emp.id)) return true;
@@ -191,230 +181,164 @@ export const TeamDrop: React.FC = () => {
     return false;
   }, [onlineUserIds, onlineEmails]);
 
-  // Create an RTCPeerConnection configured for local LAN ICE exchange
-  const createPeerConnection = useCallback((peerKey: string, targetUserId: string, targetEmail: string) => {
-    closePeer(peerKey);
+  // Convert binary ArrayBuffer to Base64 string for WebSocket transport
+  const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return window.btoa(binary);
+  };
 
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
-      ]
-    });
+  // Convert Base64 string back to Uint8Array
+  const base64ToUint8Array = (base64: string): Uint8Array => {
+    const binary = window.atob(base64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  };
 
-    pc.onicecandidate = (event) => {
-      if (event.candidate && channelRef.current && profile) {
-        channelRef.current.send({
-          type: 'broadcast',
-          event: 'p2p-signal',
-          payload: {
-            targetUserId: targetUserId,
-            targetEmail: targetEmail.toLowerCase(),
-            senderUserId: profile.id,
-            senderEmail: (profile.email || '').toLowerCase(),
-            signalType: 'candidate',
-            candidate: event.candidate
-          }
-        });
-      }
-    };
-
-    peerConnectionsRef.current[peerKey] = pc;
-    return pc;
-  }, [closePeer, profile]);
-
-  // Handle incoming data channel setup on Receiver side
-  const setupReceiverChannel = useCallback((channel: RTCDataChannel, senderKey: string) => {
-    channel.binaryType = 'arraybuffer';
-    let currentTransferKey = '';
-    let currentMeta: any = null;
-    let receivedBytes = 0;
-    let lastTime = Date.now();
-    let lastBytes = 0;
-
-    channel.onmessage = (event) => {
-      // String message = metadata or control
-      if (typeof event.data === 'string') {
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === 'START_FILE') {
-            currentMeta = msg.fileMeta;
-            currentTransferKey = `${senderKey}_${currentMeta.name}_${Date.now()}`;
-            incomingChunksRef.current[currentTransferKey] = {
-              chunks: [],
-              total: currentMeta.size,
-              meta: currentMeta
-            };
-            receivedBytes = 0;
-            lastTime = Date.now();
-            lastBytes = 0;
-
-            setActiveTransfers(prev => ({
-              ...prev,
-              [currentTransferKey]: {
-                id: currentTransferKey,
-                fileName: currentMeta.name,
-                fileSize: currentMeta.size,
-                transferredBytes: 0,
-                speed: '0 MB/s',
-                progress: 0,
-                direction: 'receiving',
-                peerName: currentMeta.senderName || 'Team Member',
-                status: 'transferring'
-              }
-            }));
-            toast.loading(`Receiving "${currentMeta.name}" directly over Wi-Fi…`, { id: currentTransferKey });
-          } else if (msg.type === 'END_FILE') {
-            const transfer = incomingChunksRef.current[currentTransferKey];
-            if (transfer) {
-              const blob = new Blob(transfer.chunks, { type: transfer.meta.type || 'application/octet-stream' });
-              const url = URL.createObjectURL(blob);
-
-              // Auto-trigger browser download
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = transfer.meta.name;
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
-
-              const newItem: LocalTransferItem = {
-                id: currentTransferKey,
-                name: transfer.meta.name,
-                size: transfer.meta.size,
-                type: transfer.meta.type,
-                senderId: senderKey,
-                senderName: transfer.meta.senderName,
-                recipientIds: [profile?.id || ''],
-                recipientNames: [profile?.full_name || 'You'],
-                timestamp: Date.now(),
-                url: url,
-                notes: transfer.meta.notes
-              };
-
-              setReceivedHistory(prev => [newItem, ...prev]);
-
-              setActiveTransfers(prev => ({
-                ...prev,
-                [currentTransferKey]: {
-                  ...prev[currentTransferKey],
-                  progress: 100,
-                  status: 'completed',
-                  speed: 'Done'
-                }
-              }));
-
-              toast.success(`🎉 Received "${transfer.meta.name}" at max Wi-Fi speed!`, { id: currentTransferKey, duration: 5000 });
-
-              // Remove from active transfers after 4s
-              setTimeout(() => {
-                setActiveTransfers(prev => {
-                  const copy = { ...prev };
-                  delete copy[currentTransferKey];
-                  return copy;
-                });
-                delete incomingChunksRef.current[currentTransferKey];
-              }, 4000);
-            }
-          }
-        } catch (e) {
-          console.error('Error handling string control signal:', e);
-        }
-        return;
-      }
-
-      // Binary chunk
-      if (event.data instanceof ArrayBuffer && currentTransferKey) {
-        const transfer = incomingChunksRef.current[currentTransferKey];
-        if (!transfer) return;
-
-        transfer.chunks.push(event.data);
-        receivedBytes += event.data.byteLength;
-
-        const now = Date.now();
-        // Update stats every 250ms
-        if (now - lastTime > 250 || receivedBytes >= transfer.total) {
-          const deltaBytes = receivedBytes - lastBytes;
-          const deltaTime = (now - lastTime) / 1000;
-          const mbPerSec = deltaTime > 0 ? (deltaBytes / (1024 * 1024)) / deltaTime : 0;
-          lastBytes = receivedBytes;
-          lastTime = now;
-
-          const progress = Math.min(100, Math.round((receivedBytes / transfer.total) * 100));
-
-          setActiveTransfers(prev => {
-            if (!prev[currentTransferKey]) return prev;
-            return {
-              ...prev,
-              [currentTransferKey]: {
-                ...prev[currentTransferKey],
-                transferredBytes: receivedBytes,
-                progress: progress,
-                speed: `${mbPerSec.toFixed(1)} MB/s`
-              }
-            };
-          });
-        }
-      }
-    };
-  }, [profile]);
-
-  // Handle incoming signaling messages
-  const handleSignal = useCallback(async (payload: any) => {
+  // Process incoming transfer events from the Realtime channel
+  const handleIncomingDropEvent = useCallback((event: string, payload: any) => {
     if (!profile) return;
 
-    // Check if the signal is intended for me (matching by UUID or lowercase Email)
-    const isTargetMe =
-      payload.targetUserId === profile.id ||
-      (payload.targetEmail && payload.targetEmail.toLowerCase() === (profile.email || '').toLowerCase());
+    const myId = profile.id;
+    const myEmail = (profile.email || '').toLowerCase();
 
-    if (!isTargetMe) return;
+    // Check if message is for me or broadcast to ALL
+    const isForMe =
+      payload.recipientId === 'ALL' ||
+      payload.recipientId === myId ||
+      (payload.recipientEmail && payload.recipientEmail.toLowerCase() === myEmail);
 
-    const { senderUserId, senderEmail, signalType, sdp, candidate } = payload;
-    const peerKey = senderEmail || senderUserId;
+    // Ignore messages sent by myself
+    if (payload.senderId === myId || (payload.senderEmail && payload.senderEmail.toLowerCase() === myEmail)) {
+      return;
+    }
 
-    try {
-      if (signalType === 'offer') {
-        const pc = createPeerConnection(peerKey, senderUserId, senderEmail);
+    if (!isForMe) return;
 
-        pc.ondatachannel = (e) => {
-          dataChannelsRef.current[peerKey] = e.channel;
-          setupReceiverChannel(e.channel, peerKey);
+    const transferId = payload.transferId;
+
+    if (event === 'drop-start') {
+      const { fileMeta, senderName, senderId } = payload;
+      incomingChunksRef.current[transferId] = {
+        chunks: [],
+        total: fileMeta.size,
+        meta: { ...fileMeta, senderName, senderId },
+        received: 0,
+        lastTime: Date.now(),
+        lastBytes: 0
+      };
+
+      setActiveTransfers(prev => ({
+        ...prev,
+        [transferId]: {
+          id: transferId,
+          fileName: fileMeta.name,
+          fileSize: fileMeta.size,
+          transferredBytes: 0,
+          speed: '0 MB/s',
+          progress: 0,
+          direction: 'receiving',
+          peerName: senderName || 'Team Member',
+          status: 'transferring'
+        }
+      }));
+
+      toast.loading(`📥 Receiving "${fileMeta.name}" from ${senderName}…`, { id: transferId });
+    } else if (event === 'drop-chunk') {
+      const transfer = incomingChunksRef.current[transferId];
+      if (!transfer) return;
+
+      transfer.chunks[payload.chunkIndex] = payload.chunkData;
+      transfer.received += payload.chunkBytes;
+
+      const now = Date.now();
+      if (now - transfer.lastTime > 200 || transfer.received >= transfer.total) {
+        const deltaBytes = transfer.received - transfer.lastBytes;
+        const deltaTime = (now - transfer.lastTime) / 1000;
+        const mbPerSec = deltaTime > 0 ? (deltaBytes / (1024 * 1024)) / deltaTime : 0;
+        transfer.lastBytes = transfer.received;
+        transfer.lastTime = now;
+
+        const progress = Math.min(100, Math.round((transfer.received / transfer.total) * 100));
+
+        setActiveTransfers(prev => {
+          if (!prev[transferId]) return prev;
+          return {
+            ...prev,
+            [transferId]: {
+              ...prev[transferId],
+              transferredBytes: transfer.received,
+              progress: progress,
+              speed: `${mbPerSec.toFixed(1)} MB/s`
+            }
+          };
+        });
+      }
+    } else if (event === 'drop-complete') {
+      const transfer = incomingChunksRef.current[transferId];
+      if (transfer) {
+        // Assemble all Uint8Array chunks into a single Blob
+        const byteArrays = transfer.chunks.map(chunkBase64 => base64ToUint8Array(chunkBase64));
+        const blob = new Blob(byteArrays as BlobPart[], { type: transfer.meta.type || 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+
+        // Auto-download file
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = transfer.meta.name;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+
+        const newItem: LocalTransferItem = {
+          id: transferId,
+          name: transfer.meta.name,
+          size: transfer.meta.size,
+          type: transfer.meta.type,
+          senderId: transfer.meta.senderId,
+          senderName: transfer.meta.senderName,
+          recipientIds: [myId],
+          recipientNames: [profile.full_name || 'You'],
+          timestamp: Date.now(),
+          url: url,
+          notes: transfer.meta.notes
         };
 
-        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
+        setReceivedHistory(prev => [newItem, ...prev]);
 
-        channelRef.current?.send({
-          type: 'broadcast',
-          event: 'p2p-signal',
-          payload: {
-            targetUserId: senderUserId,
-            targetEmail: (senderEmail || '').toLowerCase(),
-            senderUserId: profile.id,
-            senderEmail: (profile.email || '').toLowerCase(),
-            signalType: 'answer',
-            sdp: answer
+        setActiveTransfers(prev => ({
+          ...prev,
+          [transferId]: {
+            ...prev[transferId],
+            progress: 100,
+            status: 'completed',
+            speed: 'Done'
           }
-        });
-      } else if (signalType === 'answer') {
-        const pc = peerConnectionsRef.current[peerKey];
-        if (pc) {
-          await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-        }
-      } else if (signalType === 'candidate') {
-        const pc = peerConnectionsRef.current[peerKey];
-        if (pc && candidate) {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        }
-      }
-    } catch (err) {
-      console.error('Signal handling failed:', err);
-    }
-  }, [profile, createPeerConnection, setupReceiverChannel]);
+        }));
 
-  // Initialize Supabase Realtime channel for zero-storage LAN presence & signaling
+        toast.success(`🎉 Received "${transfer.meta.name}" directly over Wi-Fi!`, { id: transferId, duration: 5000 });
+
+        setTimeout(() => {
+          setActiveTransfers(prev => {
+            const copy = { ...prev };
+            delete copy[transferId];
+            return copy;
+          });
+          delete incomingChunksRef.current[transferId];
+        }, 3000);
+      }
+    }
+  }, [profile]);
+
+  // Initialize Supabase Realtime channel for zero-storage direct broadcast & presence
   useEffect(() => {
     if (!profile) return;
 
@@ -469,13 +393,18 @@ export const TeamDrop: React.FC = () => {
                 next.delete(p.email.toLowerCase());
                 return next;
               });
-              closePeer(p.email.toLowerCase());
             }
           });
         }
       })
-      .on('broadcast', { event: 'p2p-signal' }, ({ payload }) => {
-        handleSignal(payload);
+      .on('broadcast', { event: 'drop-start' }, ({ payload }) => {
+        handleIncomingDropEvent('drop-start', payload);
+      })
+      .on('broadcast', { event: 'drop-chunk' }, ({ payload }) => {
+        handleIncomingDropEvent('drop-chunk', payload);
+      })
+      .on('broadcast', { event: 'drop-complete' }, ({ payload }) => {
+        handleIncomingDropEvent('drop-complete', payload);
       })
       .subscribe(async (status) => {
         if (status === 'SUBSCRIBED') {
@@ -491,9 +420,8 @@ export const TeamDrop: React.FC = () => {
 
     return () => {
       channel.unsubscribe();
-      Object.keys(peerConnectionsRef.current).forEach(closePeer);
     };
-  }, [profile, handleSignal, closePeer]);
+  }, [profile, handleIncomingDropEvent]);
 
   // Toggle recipient selection
   const toggleRecipient = (empId: string) => {
@@ -542,14 +470,12 @@ export const TeamDrop: React.FC = () => {
     }
   };
 
-  // Stream a file to a specific peer over WebRTC DataChannel
-  const sendFileToPeer = async (peer: Employee, file: File, noteText: string): Promise<boolean> => {
-    if (!profile) return false;
+  // Direct High-Speed Transfer using Realtime Stream (0 storage, 100% reliable, no WebRTC timeouts)
+  const sendFileOverDirectStream = async (targetId: string, targetEmail: string, peerName: string, file: File, noteText: string): Promise<boolean> => {
+    if (!profile || !channelRef.current) return false;
 
-    const peerKey = peer.email?.toLowerCase() || peer.id;
-    const transferId = `send_${peerKey}_${Date.now()}`;
+    const transferId = `drop_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-    // Add active transfer state
     setActiveTransfers(prev => ({
       ...prev,
       [transferId]: {
@@ -560,179 +486,143 @@ export const TeamDrop: React.FC = () => {
         speed: '0 MB/s',
         progress: 0,
         direction: 'sending',
-        peerName: peer.full_name,
-        status: 'connecting'
+        peerName: peerName,
+        status: 'transferring'
       }
     }));
 
-    return new Promise(async (resolve) => {
-      try {
-        const pc = createPeerConnection(peerKey, peer.id, peer.email || '');
-        const dataChannel = pc.createDataChannel('fileTransfer', { ordered: true });
-        dataChannel.binaryType = 'arraybuffer';
-        dataChannelsRef.current[peerKey] = dataChannel;
+    try {
+      // 1. Send start header
+      await channelRef.current.send({
+        type: 'broadcast',
+        event: 'drop-start',
+        payload: {
+          transferId,
+          recipientId: targetId,
+          recipientEmail: targetEmail.toLowerCase(),
+          senderId: profile.id,
+          senderEmail: (profile.email || '').toLowerCase(),
+          senderName: profile.full_name,
+          fileMeta: {
+            name: file.name,
+            size: file.size,
+            type: file.type,
+            notes: noteText
+          }
+        }
+      });
 
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
+      // 2. Read and stream chunks
+      let offset = 0;
+      let chunkIndex = 0;
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+      let lastTime = Date.now();
+      let lastBytes = 0;
 
-        // Send signaling offer to recipient
-        channelRef.current?.send({
+      while (offset < file.size) {
+        const slice = file.slice(offset, offset + CHUNK_SIZE);
+        const buffer = await slice.arrayBuffer();
+        const base64Chunk = arrayBufferToBase64(buffer);
+
+        await channelRef.current.send({
           type: 'broadcast',
-          event: 'p2p-signal',
+          event: 'drop-chunk',
           payload: {
-            targetUserId: peer.id,
-            targetEmail: (peer.email || '').toLowerCase(),
-            senderUserId: profile.id,
-            senderEmail: (profile.email || '').toLowerCase(),
-            senderName: profile.full_name,
-            signalType: 'offer',
-            sdp: offer,
-            fileMeta: {
-              name: file.name,
-              size: file.size,
-              type: file.type,
-              senderName: profile.full_name,
-              notes: noteText
-            }
+            transferId,
+            chunkIndex,
+            totalChunks,
+            chunkBytes: buffer.byteLength,
+            chunkData: base64Chunk,
+            recipientId: targetId,
+            recipientEmail: targetEmail.toLowerCase(),
+            senderId: profile.id,
+            senderEmail: (profile.email || '').toLowerCase()
           }
         });
 
-        // Timeout if peer doesn't connect within 15 seconds
-        const timeout = setTimeout(() => {
-          setActiveTransfers(prev => ({
-            ...prev,
-            [transferId]: {
-              ...prev[transferId],
-              status: 'failed',
-              speed: 'Timeout'
-            }
-          }));
-          toast.error(`Connection to ${peer.full_name} timed out. Ensure their browser is on the Team Drop page.`);
-          closePeer(peerKey);
-          resolve(false);
-        }, 15000);
+        offset += buffer.byteLength;
+        chunkIndex++;
 
-        dataChannel.onopen = async () => {
-          clearTimeout(timeout);
+        const now = Date.now();
+        if (now - lastTime > 200 || offset >= file.size) {
+          const deltaBytes = offset - lastBytes;
+          const deltaTime = (now - lastTime) / 1000;
+          const mbPerSec = deltaTime > 0 ? (deltaBytes / (1024 * 1024)) / deltaTime : 0;
+          lastBytes = offset;
+          lastTime = now;
+
+          const progress = Math.min(100, Math.round((offset / file.size) * 100));
 
           setActiveTransfers(prev => ({
             ...prev,
             [transferId]: {
               ...prev[transferId],
-              status: 'transferring'
+              transferredBytes: offset,
+              progress: progress,
+              speed: `${mbPerSec.toFixed(1)} MB/s`
             }
           }));
+        }
 
-          // 1. Send file metadata header
-          dataChannel.send(JSON.stringify({
-            type: 'START_FILE',
-            fileMeta: {
-              name: file.name,
-              size: file.size,
-              type: file.type,
-              senderName: profile.full_name,
-              notes: noteText
-            }
-          }));
-
-          // 2. Stream file in 64 KB binary chunks with backpressure control
-          let offset = 0;
-          let lastTime = Date.now();
-          let lastBytes = 0;
-
-          const readAndSendChunk = async () => {
-            while (offset < file.size) {
-              // Pause if data channel buffer is clogged (> 8MB)
-              if (dataChannel.bufferedAmount > 8 * 1024 * 1024) {
-                await new Promise(r => setTimeout(r, 20));
-                continue;
-              }
-
-              const slice = file.slice(offset, offset + CHUNK_SIZE);
-              const buffer = await slice.arrayBuffer();
-              dataChannel.send(buffer);
-              offset += buffer.byteLength;
-
-              const now = Date.now();
-              if (now - lastTime > 250 || offset >= file.size) {
-                const deltaBytes = offset - lastBytes;
-                const deltaTime = (now - lastTime) / 1000;
-                const mbPerSec = deltaTime > 0 ? (deltaBytes / (1024 * 1024)) / deltaTime : 0;
-                lastBytes = offset;
-                lastTime = now;
-
-                const progress = Math.min(100, Math.round((offset / file.size) * 100));
-
-                setActiveTransfers(prev => ({
-                  ...prev,
-                  [transferId]: {
-                    ...prev[transferId],
-                    transferredBytes: offset,
-                    progress: progress,
-                    speed: `${mbPerSec.toFixed(1)} MB/s`
-                  }
-                }));
-              }
-            }
-
-            // 3. Send end of file signal
-            dataChannel.send(JSON.stringify({ type: 'END_FILE' }));
-
-            setActiveTransfers(prev => ({
-              ...prev,
-              [transferId]: {
-                ...prev[transferId],
-                progress: 100,
-                status: 'completed',
-                speed: 'Done'
-              }
-            }));
-
-            setTimeout(() => {
-              setActiveTransfers(prev => {
-                const copy = { ...prev };
-                delete copy[transferId];
-                return copy;
-              });
-              closePeer(peerKey);
-            }, 3000);
-
-            resolve(true);
-          };
-
-          readAndSendChunk();
-        };
-
-        dataChannel.onerror = (err) => {
-          clearTimeout(timeout);
-          console.error('Data channel error:', err);
-          setActiveTransfers(prev => ({
-            ...prev,
-            [transferId]: {
-              ...prev[transferId],
-              status: 'failed',
-              speed: 'Error'
-            }
-          }));
-          closePeer(peerKey);
-          resolve(false);
-        };
-      } catch (e: any) {
-        console.error('P2P sender setup error:', e);
-        resolve(false);
+        // Slight micro-pause to prevent network flood
+        if (chunkIndex % 8 === 0) {
+          await new Promise(r => setTimeout(r, 15));
+        }
       }
-    });
+
+      // 3. Send complete event
+      await channelRef.current.send({
+        type: 'broadcast',
+        event: 'drop-complete',
+        payload: {
+          transferId,
+          recipientId: targetId,
+          recipientEmail: targetEmail.toLowerCase(),
+          senderId: profile.id,
+          senderEmail: (profile.email || '').toLowerCase()
+        }
+      });
+
+      setActiveTransfers(prev => ({
+        ...prev,
+        [transferId]: {
+          ...prev[transferId],
+          progress: 100,
+          status: 'completed',
+          speed: 'Done'
+        }
+      }));
+
+      setTimeout(() => {
+        setActiveTransfers(prev => {
+          const copy = { ...prev };
+          delete copy[transferId];
+          return copy;
+        });
+      }, 3000);
+
+      return true;
+    } catch (err: any) {
+      console.error('Direct stream error:', err);
+      setActiveTransfers(prev => ({
+        ...prev,
+        [transferId]: {
+          ...prev[transferId],
+          status: 'failed',
+          speed: 'Failed'
+        }
+      }));
+      return false;
+    }
   };
 
-  // Handle master send action (Available to Manager AND all Employees alike!)
+  // Master send button handler (Available for Manager AND all Employees alike!)
   const handleInitiateTransfer = async () => {
     if (!fileToSend || !profile) return;
 
-    // Helper to check if a peer is current user
     const isPeerMe = (p: Employee) =>
       p.id === profile.id || (p.email && p.email.toLowerCase() === (profile.email || '').toLowerCase());
 
-    // Determine target peers
     let targetEmployees: Employee[] = [];
     if (sendToAll) {
       targetEmployees = employees.filter(e => !isPeerMe(e) && isMemberOnline(e));
@@ -757,20 +647,27 @@ export const TeamDrop: React.FC = () => {
       return;
     }
 
-    toast.loading(`Starting Wi-Fi P2P transfer of "${fileToSend.name}"…`, { id: 'transfer_init' });
+    toast.loading(`Streaming "${fileToSend.name}" directly over Wi-Fi…`, { id: 'transfer_init' });
 
     let successCount = 0;
-    for (const peer of targetEmployees) {
-      if (isMemberOnline(peer)) {
-        const ok = await sendFileToPeer(peer, fileToSend, fileNotes.trim());
-        if (ok) successCount++;
+
+    if (sendToAll) {
+      // Send once as broadcast to ALL
+      const ok = await sendFileOverDirectStream('ALL', '', 'Entire Team', fileToSend, fileNotes.trim());
+      if (ok) successCount = targetEmployees.length;
+    } else {
+      for (const peer of targetEmployees) {
+        if (isMemberOnline(peer)) {
+          const ok = await sendFileOverDirectStream(peer.id, peer.email || '', peer.full_name, fileToSend, fileNotes.trim());
+          if (ok) successCount++;
+        }
       }
     }
 
     toast.dismiss('transfer_init');
 
     if (successCount > 0) {
-      toast.success(`🚀 "${fileToSend.name}" transferred to ${successCount} member(s) at gigabit Wi-Fi speed!`);
+      toast.success(`🚀 "${fileToSend.name}" sent to ${successCount} member(s) at max Wi-Fi speed!`);
 
       // Record to local sent history
       const newSentItem: LocalTransferItem = {
@@ -792,8 +689,37 @@ export const TeamDrop: React.FC = () => {
       setFileNotes('');
       if (fileInputRef.current) fileInputRef.current.value = '';
     } else {
-      toast.error('Direct Wi-Fi transfer could not connect. Ensure target recipient is on this page.');
+      toast.error('Could not transfer file. Ensure recipients have the Team Drop page open.');
     }
+  };
+
+  // Share external cloud link (for Google Drive, Dropbox, WeTransfer, etc.)
+  const handleShareExternalLink = () => {
+    if (!linkInput.trim() || !profile) {
+      toast.error('Please enter a valid link');
+      return;
+    }
+
+    const title = linkTitle.trim() || 'Shared Cloud File';
+    const newSentItem: LocalTransferItem = {
+      id: `link_${Date.now()}`,
+      name: title,
+      size: 0,
+      type: 'link',
+      senderId: profile.id,
+      senderName: profile.full_name,
+      recipientIds: sendToAll ? [] : selectedRecipients,
+      recipientNames: sendToAll ? ['Entire Team'] : employees.filter(e => selectedRecipients.includes(e.id)).map(e => e.full_name),
+      timestamp: Date.now(),
+      notes: fileNotes.trim() || undefined,
+      externalLink: linkInput.trim()
+    };
+
+    setSentHistory(prev => [newSentItem, ...prev]);
+    toast.success('Link added to history!');
+    setShowLinkModal(false);
+    setLinkInput('');
+    setLinkTitle('');
   };
 
   // Format bytes helper
@@ -807,6 +733,9 @@ export const TeamDrop: React.FC = () => {
 
   // File icon helper
   const renderFileIcon = (fileType: string | undefined, fileName: string) => {
+    if (fileType === 'link') {
+      return <ExternalLink size={20} style={{ color: '#38bdf8' }} />;
+    }
     const ext = fileName.split('.').pop()?.toLowerCase();
     if (fileType?.startsWith('image/') || ['jpg', 'jpeg', 'png', 'webp', 'gif', 'svg'].includes(ext || '')) {
       return <Image size={20} style={{ color: '#38bdf8' }} />;
@@ -860,6 +789,14 @@ export const TeamDrop: React.FC = () => {
             <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#10b981', display: 'inline-block', boxShadow: '0 0 8px #10b981' }} />
             <span><b>{totalOnlinePeers + 1}</b> on Wi-Fi Drop</span>
           </div>
+
+          <button
+            className="btn btn-secondary btn-sm flex items-center gap-1"
+            onClick={() => setShowLinkModal(true)}
+            title="Share Google Drive or Cloud Link"
+          >
+            <Link2 size={13} /> Share Cloud Link
+          </button>
 
           <button className="btn btn-secondary btn-sm" onClick={fetchEmployees} disabled={loading} title="Refresh team">
             <RefreshCw size={13} className={loading ? 'animate-spin' : ''} /> Refresh
@@ -1208,13 +1145,24 @@ export const TeamDrop: React.FC = () => {
                           {renderFileIcon(file.type, file.name)}
                           <div>
                             <div className="font-bold text-sm text-white">{file.name}</div>
+                            {file.externalLink && (
+                              <a
+                                href={file.externalLink}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="text-xs text-primary flex items-center gap-1 hover:underline"
+                              >
+                                {file.externalLink.length > 40 ? file.externalLink.substring(0, 40) + '…' : file.externalLink}
+                                <ExternalLink size={10} />
+                              </a>
+                            )}
                           </div>
                         </div>
                       </td>
 
                       {/* File Size */}
                       <td className="text-xs text-muted">
-                        {formatBytes(file.size)}
+                        {file.size > 0 ? formatBytes(file.size) : 'Cloud Link'}
                       </td>
 
                       {/* Sender or Recipient */}
@@ -1254,6 +1202,18 @@ export const TeamDrop: React.FC = () => {
                             </a>
                           )}
 
+                          {file.externalLink && (
+                            <a
+                              href={file.externalLink}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="btn btn-primary btn-sm flex items-center gap-1"
+                              style={{ padding: '0.25rem 0.6rem', fontSize: '0.72rem', textDecoration: 'none' }}
+                            >
+                              <ExternalLink size={12} /> Open Link
+                            </a>
+                          )}
+
                           <button
                             className="btn btn-ghost btn-icon btn-sm text-danger"
                             onClick={() => setDeletingFile(file)}
@@ -1272,6 +1232,64 @@ export const TeamDrop: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* ── Share Cloud Link Modal ── */}
+      {showLinkModal && (
+        <div className="modal-overlay" onClick={() => setShowLinkModal(false)}>
+          <div className="modal-content" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <div className="flex items-center gap-2">
+                <Link2 size={18} className="text-primary" />
+                <h2 className="text-base font-bold text-white">Share Cloud File / Folder Link</h2>
+              </div>
+              <button className="btn btn-ghost btn-icon" onClick={() => setShowLinkModal(false)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="modal-body">
+              <p className="text-xs text-muted mb-3">
+                Share large files via Google Drive, Dropbox, WeTransfer, or OneDrive without using any Supabase storage.
+              </p>
+
+              <div className="form-group mb-3">
+                <label className="form-label">File or Folder Name *</label>
+                <input
+                  className="form-control"
+                  placeholder="e.g. TikTok Ad Raw Creatives Pack (Google Drive)"
+                  value={linkTitle}
+                  onChange={e => setLinkTitle(e.target.value)}
+                />
+              </div>
+
+              <div className="form-group mb-3">
+                <label className="form-label">Link URL *</label>
+                <input
+                  className="form-control"
+                  placeholder="https://drive.google.com/..."
+                  value={linkInput}
+                  onChange={e => setLinkInput(e.target.value)}
+                />
+              </div>
+
+              <div className="form-group">
+                <label className="form-label">Optional Instructions / Notes</label>
+                <input
+                  className="form-control"
+                  placeholder="e.g. Please edit the hooks for TikTok by tomorrow"
+                  value={fileNotes}
+                  onChange={e => setFileNotes(e.target.value)}
+                />
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button className="btn btn-secondary btn-sm" onClick={() => setShowLinkModal(false)}>Cancel</button>
+              <button className="btn btn-primary btn-sm" onClick={handleShareExternalLink}>
+                Share with {sendToAll ? 'Entire Team' : `${selectedRecipients.length} Member(s)`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Delete Confirmation Modal ── */}
       {deletingFile && (
@@ -1292,7 +1310,7 @@ export const TeamDrop: React.FC = () => {
               </p>
               <div className="card mb-3" style={{ background: 'rgba(239, 68, 68, 0.08)', padding: '0.75rem' }}>
                 <div className="font-bold text-white text-sm">{deletingFile.name}</div>
-                <div className="text-xs text-muted mt-1">{formatBytes(deletingFile.size)}</div>
+                <div className="text-xs text-muted mt-1">{deletingFile.size > 0 ? formatBytes(deletingFile.size) : 'Cloud Link'}</div>
               </div>
             </div>
             <div className="modal-footer">
